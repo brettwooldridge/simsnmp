@@ -1,14 +1,11 @@
 package com.lbayer.simsnmp;
 
+import jdk.nashorn.api.scripting.NashornScriptEngineFactory;
 import org.apache.log4j.ConsoleAppender;
 import org.apache.log4j.Level;
 import org.apache.log4j.Logger;
 import org.apache.log4j.PatternLayout;
-import org.snmp4j.CommandResponder;
-import org.snmp4j.CommandResponderEvent;
-import org.snmp4j.MessageException;
-import org.snmp4j.PDU;
-import org.snmp4j.Snmp;
+import org.snmp4j.*;
 import org.snmp4j.mp.MPv3;
 import org.snmp4j.mp.MessageProcessingModel;
 import org.snmp4j.mp.SnmpConstants;
@@ -16,19 +13,9 @@ import org.snmp4j.mp.StatusInformation;
 import org.snmp4j.security.SecurityModels;
 import org.snmp4j.security.SecurityProtocols;
 import org.snmp4j.security.USM;
-import org.snmp4j.smi.IpAddress;
-import org.snmp4j.smi.Null;
-import org.snmp4j.smi.OID;
-import org.snmp4j.smi.OctetString;
-import org.snmp4j.smi.VariableBinding;
+import org.snmp4j.smi.*;
 
-import javax.script.Bindings;
-import javax.script.Invocable;
-import javax.script.ScriptContext;
-import javax.script.ScriptEngine;
-import javax.script.ScriptEngineManager;
-import javax.script.ScriptException;
-import javax.script.SimpleScriptContext;
+import javax.script.*;
 import java.io.File;
 import java.io.FileReader;
 import java.io.IOException;
@@ -36,12 +23,8 @@ import java.io.Reader;
 import java.net.InetAddress;
 import java.net.NetworkInterface;
 import java.net.SocketException;
-import java.util.ArrayList;
-import java.util.Arrays;
-import java.util.Enumeration;
-import java.util.List;
-import java.util.ListIterator;
-import java.util.Properties;
+import java.nio.file.*;
+import java.util.*;
 import java.util.concurrent.Semaphore;
 
 public class Server implements CommandResponder
@@ -50,11 +33,11 @@ public class Server implements CommandResponder
 
     private Snmp snmp;
     private int port;
-    private String handler;
-    private long lastModified;
+    private String handlerScriptName;
     private Invocable handlerImpl;
+    private WatchService watchService;
 
-    protected Server()
+    private Server()
     {
     }
 
@@ -114,7 +97,7 @@ public class Server implements CommandResponder
         {
             Server server = new Server();
             server.port = Integer.parseInt(props.getProperty("port", "161"));
-            server.handler = props.getProperty("handler", "agent.js");
+            server.handlerScriptName = props.getProperty("handler", System.getProperty("handler", "agent.js"));
             server.startServer();
         }
         catch (Throwable e)
@@ -123,41 +106,47 @@ public class Server implements CommandResponder
         }
     }
 
-    private synchronized Invocable getHandler() throws ScriptException, IOException
+    private synchronized Invocable getHandlerScript()
     {
-        long newLastModified = new File(handler).lastModified();
-
-        if (handlerImpl == null || newLastModified != lastModified)
+        if (handlerImpl != null)
         {
-            lastModified = newLastModified;
+            LOGGER.info("Handler script modified, reloading");
+        }
 
-            if (handlerImpl != null)
-            {
-                LOGGER.info("Handler script modified, reloading");
-            }
+        try (Reader r = new FileReader(handlerScriptName)) {
+            ScriptContext ctx = new SimpleScriptContext();
+            Bindings bindings = ctx.getBindings(ScriptContext.GLOBAL_SCOPE);
+            bindings.put("LOGGER", LOGGER);
 
-            try (Reader r = new FileReader(handler))
-            {
-                ScriptContext ctx = new SimpleScriptContext();
-                Bindings bindings = ctx.getBindings(ScriptContext.ENGINE_SCOPE);
-                bindings.put("LOGGER", LOGGER);
+            LOGGER.info("Loading script " + handlerScriptName + "...");
 
-                ScriptEngineManager engineManager = new ScriptEngineManager();
-                ScriptEngine engine = engineManager.getEngineByName("nashorn");
-                engine.setContext(ctx);
-                engine.eval(r);
+            ScriptEngine engine = new NashornScriptEngineFactory().getScriptEngine("--language=es6");
+            engine.setContext(ctx);
+            engine.eval(r);
 
-                handlerImpl = (Invocable) engine;
-            }
+            handlerImpl = (Invocable) engine;
+        }
+        catch (ScriptException | IOException e) {
+            throw new RuntimeException(e);
         }
 
         return handlerImpl;
     }
 
-    public VariableBinding getValue(String source, String target, int type, OID oid)
-    {
-        try
-        {
+    private VariableBinding getValue(String source, String target, int type, OID oid) {
+        try {
+            // Check the watch service to see whether the script has changed (and reload)
+            for (WatchKey key = watchService.take(); key != null; key = watchService.take()) {
+                for (WatchEvent<?> event : key.pollEvents()) {
+                    final Path path = (Path) event.context();
+                    if (event.kind() != StandardWatchEventKinds.OVERFLOW && path.endsWith(handlerScriptName)) {
+                        handlerImpl = getHandlerScript();
+                        break;
+                    }
+                }
+                key.reset();
+            }
+
             String method;
             switch (type)
             {
@@ -173,10 +162,9 @@ public class Server implements CommandResponder
                 return null;
             }
 
-            return (VariableBinding) getHandler().invokeFunction(method, source, target, oid.toDottedString());
+            return (VariableBinding) handlerImpl.invokeFunction(method, source, target, oid.toDottedString());
         }
-        catch (NoSuchMethodException | ScriptException | IOException e)
-        {
+        catch (NoSuchMethodException | ScriptException | InterruptedException e) {
             LOGGER.error("Error executing handler script", e);
             return null;
         }
@@ -256,33 +244,34 @@ public class Server implements CommandResponder
         List<String> addresses = new ArrayList<>();
 
         Enumeration<NetworkInterface> ifaces = NetworkInterface.getNetworkInterfaces();
-        if (ifaces != null)
-        {
-            while (ifaces.hasMoreElements())
-            {
-                Enumeration<InetAddress> inetAddresses = ifaces.nextElement().getInetAddresses();
-                while (inetAddresses.hasMoreElements())
-                {
-                    String addr = inetAddresses.nextElement().getHostAddress();
-                    addresses.add(addr);
-                    LOGGER.debug("Added listen address: " + addr);
-                }
+        while (ifaces.hasMoreElements()) {
+            Enumeration<InetAddress> inetAddresses = ifaces.nextElement().getInetAddresses();
+            while (inetAddresses.hasMoreElements()) {
+                String addr = inetAddresses.nextElement().getHostAddress();
+                addresses.add(addr);
+                LOGGER.debug("Added listen address: " + addr);
             }
         }
 
         return addresses;
     }
 
-    public void startServer() throws IOException, InterruptedException
+    private void startServer() throws IOException
     {
         LOGGER.info("Starting SNMP server");
 
-        List<String> addresses = getBindAddresses();
+        final List<String> addresses = getBindAddresses();
         if (addresses.isEmpty())
         {
             LOGGER.warn("No addresses to bind to");
             return;
         }
+
+        handlerImpl = getHandlerScript();
+
+        watchService = FileSystems.getDefault().newWatchService();
+        final Path path = Paths.get(handlerScriptName).getParent();
+        path.register(watchService, StandardWatchEventKinds.ENTRY_MODIFY);
 
         NettyUdpTransportMapping transport = new NettyUdpTransportMapping(addresses, port);
 

@@ -1,0 +1,12 @@
+[Unit]
+Description=Simulator SNMP Agent
+After=network.target
+
+[Service]
+ExecStart=/usr/bin/java -jar /root/sim/simsnmp-all.jar
+WorkingDirectory=/root/sim
+User=root
+LimitNOFILE=32786
+
+[Install]
+WantedBy=multi-user-target

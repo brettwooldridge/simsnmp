@@ -2,12 +2,7 @@ package com.lbayer.simsnmp;
 
 import io.netty.bootstrap.Bootstrap;
 import io.netty.buffer.Unpooled;
-import io.netty.channel.Channel;
-import io.netty.channel.ChannelHandlerContext;
-import io.netty.channel.ChannelInitializer;
-import io.netty.channel.ChannelOption;
-import io.netty.channel.DefaultMessageSizeEstimator;
-import io.netty.channel.SimpleChannelInboundHandler;
+import io.netty.channel.*;
 import io.netty.channel.nio.NioEventLoopGroup;
 import io.netty.channel.socket.DatagramPacket;
 import io.netty.channel.socket.nio.NioDatagramChannel;
@@ -16,11 +11,9 @@ import io.netty.util.concurrent.DefaultThreadFactory;
 import org.apache.log4j.Logger;
 import org.snmp4j.TransportStateReference;
 import org.snmp4j.security.SecurityLevel;
-import org.snmp4j.smi.OctetString;
 import org.snmp4j.smi.UdpAddress;
 import org.snmp4j.transport.UdpTransportMapping;
 
-import java.io.IOException;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.util.ArrayList;
@@ -50,10 +43,8 @@ public class NettyUdpTransportMapping extends UdpTransportMapping
 
     /**
      * Create the mapping.
-     * @throws IOException If the local bind address can't be found.
      */
-    public NettyUdpTransportMapping(List<String> addresses, int port) throws IOException
-    {
+    NettyUdpTransportMapping(List<String> addresses, int port) {
         super(null);
         localTransport = new ThreadLocal<>();
         this.addresses = addresses;
@@ -67,9 +58,8 @@ public class NettyUdpTransportMapping extends UdpTransportMapping
     }
 
     @Override
-    public void listen() throws IOException
-    {
-        executor = new ThreadPoolExecutor(32, 32, 10, TimeUnit.SECONDS, new LinkedBlockingDeque<Runnable>());
+    public void listen() {
+        executor = new ThreadPoolExecutor(2, 2, 10, TimeUnit.SECONDS, new LinkedBlockingDeque<>());
         executor.allowCoreThreadTimeOut(true);
         executor.setThreadFactory(new ThreadFactory()
         {
@@ -80,13 +70,9 @@ public class NettyUdpTransportMapping extends UdpTransportMapping
             {
                 Thread t = new Thread(r, "SNMP Worker " + count.getAndIncrement());
                 t.setDaemon(true);
-                t.setUncaughtExceptionHandler(new Thread.UncaughtExceptionHandler()
-                {
-                    public void uncaughtException(Thread t, Throwable e)
-                    {
-                        LOGGER.error("Uncaught exception", e);
-                        Thread.getDefaultUncaughtExceptionHandler().uncaughtException(t, e);
-                    }
+                t.setUncaughtExceptionHandler((t1, e) -> {
+                    LOGGER.error("Uncaught exception", e);
+                    Thread.getDefaultUncaughtExceptionHandler().uncaughtException(t1, e);
                 });
                 return t;
             }
@@ -98,35 +84,35 @@ public class NettyUdpTransportMapping extends UdpTransportMapping
         for (String address : addresses)
         {
             int receiveBufferSize = (1 << 16) - 1;
-            channels.add(new Bootstrap()
-                                 .group(eventLoop)
-                                 .channel(NioDatagramChannel.class)
-                                 .option(ChannelOption.SO_RCVBUF, receiveBufferSize)
-                                 .option(ChannelOption.MESSAGE_SIZE_ESTIMATOR, new DefaultMessageSizeEstimator(receiveBufferSize))
-                                 .handler(new ChannelInitializer<Channel>()
-                                 {
-                                     @Override
-                                     protected void initChannel(Channel c) throws Exception
-                                     {
-                                         c.pipeline().addLast(new SnmpDecoder(), new ByteArrayEncoder());
-                                     }
+            channels.add(
+                new Bootstrap()
+                    .group(eventLoop)
+                    .channel(NioDatagramChannel.class)
+                    .option(ChannelOption.SO_RCVBUF, receiveBufferSize)
+                    .option(ChannelOption.MESSAGE_SIZE_ESTIMATOR, new DefaultMessageSizeEstimator(receiveBufferSize))
+                    .handler(new ChannelInitializer<Channel>()
+                    {
+                        @Override
+                        protected void initChannel(Channel c) {
+                            c.pipeline().addLast(new SnmpDecoder(), new ByteArrayEncoder());
+                        }
 
-                                     @Override
-                                     public void exceptionCaught(ChannelHandlerContext ctx, Throwable cause) throws Exception
-                                     {
-                                         super.exceptionCaught(ctx, cause);
-                                         LOGGER.error("Error in SNMP listener", cause);
-                                     }
-                                 })
-                                 .bind(new InetSocketAddress(address, port))
-                                 .syncUninterruptibly()
-                                 .channel());
+                        @Override
+                        public void exceptionCaught(ChannelHandlerContext ctx, Throwable cause) throws Exception
+                        {
+                            super.exceptionCaught(ctx, cause);
+                            LOGGER.error("Error in SNMP listener", cause);
+                        }
+                    })
+                    .bind(new InetSocketAddress(address, port))
+                    .syncUninterruptibly()
+                    .channel()
+            );
         }
     }
 
     @Override
-    public void close() throws IOException
-    {
+    public void close() {
         if (channels != null)
         {
             for (Channel channel : channels)
@@ -141,19 +127,16 @@ public class NettyUdpTransportMapping extends UdpTransportMapping
     }
 
     @Override
-    public void sendMessage(UdpAddress targetAddress, byte[] message, TransportStateReference transportStateReference) throws IOException
-    {
-        UdpAddress target = (UdpAddress) targetAddress;
-        InetAddress inetAddress = target.getInetAddress();
-        InetSocketAddress socketAddress = new InetSocketAddress(inetAddress, target.getPort());
+    public void sendMessage(UdpAddress targetAddress, byte[] message, TransportStateReference transportStateReference) {
+        InetAddress inetAddress = targetAddress.getInetAddress();
+        InetSocketAddress socketAddress = new InetSocketAddress(inetAddress, targetAddress.getPort());
 
         TransportStateReference t = localTransport.get();
         Channel channel = (Channel) t.getSessionID();
         channel.writeAndFlush(new DatagramPacket(Unpooled.wrappedBuffer(message), socketAddress));
     }
 
-    public String getLocalIp()
-    {
+    String getLocalIp() {
         TransportStateReference t = localTransport.get();
         if (t == null)
         {
@@ -166,39 +149,31 @@ public class NettyUdpTransportMapping extends UdpTransportMapping
     /**
      * SNMP response handler
      */
-    private class SnmpDecoder extends SimpleChannelInboundHandler<DatagramPacket>
-    {
+    private class SnmpDecoder extends SimpleChannelInboundHandler<DatagramPacket> {
         @Override
-        public void exceptionCaught(ChannelHandlerContext ctx, Throwable cause) throws Exception
-        {
+        public void exceptionCaught(ChannelHandlerContext ctx, Throwable cause) {
             LOGGER.warn("Exception caught processing SNMP response", cause);
         }
 
         @Override
-        protected void channelRead0(final ChannelHandlerContext ctx, final DatagramPacket packet) throws Exception
-        {
+        protected void channelRead0(final ChannelHandlerContext ctx, final DatagramPacket packet) {
             packet.retain();
 
-            executor.execute(new Runnable()
-            {
-                @Override
-                public void run()
+            executor.execute(() -> {
+                try
                 {
-                    try
-                    {
-                        Channel channel = ctx.channel();
-                        InetSocketAddress remoteAddress = (InetSocketAddress) packet.sender();
-                        InetSocketAddress localAddress = (InetSocketAddress) channel.localAddress();
-                        UdpAddress localUdpAddress = new UdpAddress(localAddress.getAddress(), localAddress.getPort());
+                    Channel channel = ctx.channel();
+                    InetSocketAddress remoteAddress = packet.sender();
+                    InetSocketAddress localAddress = (InetSocketAddress) channel.localAddress();
+                    UdpAddress localUdpAddress = new UdpAddress(localAddress.getAddress(), localAddress.getPort());
 
-                        TransportStateReference tsr = new TransportStateReference(NettyUdpTransportMapping.this, localUdpAddress, (OctetString)null, SecurityLevel.undefined, SecurityLevel.undefined, false, channel);
-                        localTransport.set(tsr);
-                        fireProcessMessage(new UdpAddress(remoteAddress.getAddress(), remoteAddress.getPort()), packet.content().nioBuffer(), tsr);
-                    }
-                    finally
-                    {
-                        packet.release();
-                    }
+                    TransportStateReference tsr = new TransportStateReference(NettyUdpTransportMapping.this, localUdpAddress, null, SecurityLevel.undefined, SecurityLevel.undefined, false, channel);
+                    localTransport.set(tsr);
+                    fireProcessMessage(new UdpAddress(remoteAddress.getAddress(), remoteAddress.getPort()), packet.content().nioBuffer(), tsr);
+                }
+                finally
+                {
+                    packet.release();
                 }
             });
         }

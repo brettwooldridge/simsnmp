@@ -6,15 +6,15 @@
 
   <groupId>com.dancernetworks</groupId>
   <artifactId>simsnmp</artifactId>
-  <version>1.0-SNAPSHOT</version>
+  <version>1.1-SNAPSHOT</version>
   <packaging>jar</packaging>
 
-  <repositories>
+  <!-- repositories>
     <repository>
       <id>oosnmp.net</id>
       <url>https://oosnmp.net/dist/release</url>
     </repository>
-  </repositories>
+  </repositories -->
 
   <build>
     <pluginManagement>
@@ -51,7 +51,7 @@
     <dependency>
       <groupId>org.snmp4j</groupId>
       <artifactId>snmp4j</artifactId>
-      <version>2.3.3</version>
+      <version>2.7.0</version>
     </dependency>
     <dependency>
       <groupId>io.netty</groupId>
