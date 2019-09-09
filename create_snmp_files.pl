@@ -5,8 +5,8 @@ use warnings;
 
 my $BASE_ADDR="10.129";
 
-unless (-e "basemib.txt") {
-    print "Error: cannot find basemib.txt file.\n";
+unless (-e "loadtest.snmp") {
+    print "Error: cannot find loadtest.snmp file.\n";
     exit(-1);
 }
 
@@ -14,7 +14,7 @@ foreach my $c (0 .. 19)
 {
     foreach my $d (1 .. 254)
     {
-        my $command = "cp basemib.txt $BASE_ADDR.$c.$d.snmp";
+        my $command = "cp loadtest.snmp $BASE_ADDR.$c.$d.snmp";
         print $command . "\n";
         print `$command`;
     }

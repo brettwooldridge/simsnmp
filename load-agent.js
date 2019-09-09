@@ -23,7 +23,7 @@ var OID_NAMES = {
 {
     const snmpFiles = listSnmpFiles();   // *.snmp
     snmpFiles.forEach(function(file) {
-        const name = file.substr(-5);    // eg. 10.129.0.1.snmp => 10.129.0.1
+        const name = file.substr(0, file.length - 5);    // eg. 10.129.0.1.snmp => 10.129.0.1
         loadSnmpValues(name);
     });
 }
@@ -46,12 +46,7 @@ function get(source, target, oid) {
     LOGGER.debug("get: " + source + "->" + target + " " + oid);
     const value = doGet(source, target, oid);
     LOGGER.debug("response: " + value);
-    if (value) {
-        return binding(oid, value);
-    }
-
-    LOGGER.debug("Returning null");
-    return null;
+    return value;
 }
 
 // noinspection JSUnusedGlobalSymbols
@@ -64,7 +59,8 @@ function get(source, target, oid) {
  * @returns the binding or null
  */
 function getnext(source, target, oid) {
-    LOGGER.info("getnext: " + source + "->" + target + " " + oid);
+    // if (LOGGER.isDebugEnabled()) LOGGER.debug("getnext: " + source + "->" + target + "   oid: " + oid);
+
     let new_oid;
     if (oid === "1.3.6.1.2.1.1") {
         new_oid = "1.3.6.1.2.1.1.1.0";
@@ -84,38 +80,38 @@ function getnext(source, target, oid) {
 
         const valueIterator = sessionMap.computeIfAbsent(source + target, function(key) {
             let snmpValues = loadedValues.get(target);
-            LOGGER.info("snmpValues=" + snmpValues);
-            if (!snmpValues) {
-                snmpValues = loadSnmpValues(target);
-                if (!snmpValues) return null;
+            // if (LOGGER.isDebugEnabled()) LOGGER.debug("snmpValues=" + snmpValues);
+            if (snmpValues == null) {
+                return null;
             }
 
+            // Iterator of VariableBindinds
             const iterator = new java.util.ArrayList(snmpValues.entrySet()).listIterator();
             while (iterator.hasNext()) {
                 const entry = iterator.next();
-                if (entry.getKey().endsWith(oid)) {
-                    LOGGER.info("Iterator stopped on entry=" + entry);
+                if (entry.getKey().startsWith('.' + oid)) {
+                    iterator.previous();
                     break;
                 }
             }
-            return iterator;
+            return (iterator.hasNext() ? iterator : new java.util.ArrayList(snmpValues.entrySet()).listIterator());
         });
 
         if (valueIterator == null) return null;
 
         if (!valueIterator.hasNext()) {
-            LOGGER.info("Iterator exhausted.  Removing and recalculating.");
+            // if (LOGGER.isDebugEnabled()) LOGGER.debug("Iterator exhausted.  Removing.");
             sessionMap.remove(source + target);
-            return getnext(source, target, oid)
+            return null;
         }
 
         value = valueIterator.next();
 
-        LOGGER.info("response: " + value);
-        return binding(value.getKey(), value.getValue());
+        // if (LOGGER.isDebugEnabled()) LOGGER.debug("response: " + value);
+        return value.getValue();
     }
 
-    LOGGER.debug("getnext: " + oid + " ==> " + new_oid);
+    // if (LOGGER.isDebugEnabled()) LOGGER.debug("getnext: " + oid + " ==> " + new_oid);
     return get(source, target, new_oid);
 }
 
@@ -123,48 +119,6 @@ function getnext(source, target, oid) {
 /*******************************************************************************************************************
  *                                                  INTERNAL API
  *******************************************************************************************************************/
-
-function loadSnmpValues(target) {
-    const filename = target + ".snmp";
-    if (!new_file(filename).isFile()) {
-        return null;
-    }
-
-    let prevKey;
-    const result = new java.util.LinkedHashMap();
-    readFile(filename)
-        .forEach(function(line) {
-            const keyValue = line.split(' = ', 2);
-            let key = keyValue[0];
-            let value = keyValue.length > 1 ? keyValue[1] : null;
-
-            if (!value) {  // text line continuation
-                // key exists from previous loop iteration
-                result.put(prevKey, result.get(prevKey) + "\n" + key[0]);
-            } else {
-                if (OID_NAMES[key]) {
-                    key = OID_NAMES[key];
-                }
-
-                if (value.startsWith('STRING: ')) {
-                    value = value.substring(8);
-                } else if (value.startsWith('INTEGER: ')) {
-                    value = value.substring(9);
-                } else if (value.startsWith('OID: ')) {
-                    value = value.substring(5);
-                    if (value.startsWith('SNMPv2-SMI::enterprises')) {
-                        value = '.1.3.6.1.4.1' + value.substring(23);
-                    }
-                }
-
-                result.put(key, value);
-                prevKey = key;
-            }
-        });
-
-    loadedValues.put(target, result);
-    return result;
-}
 
 function handleController(source, target, oid) {
     if (oid === '1.3.6.1.2.1.1.1.0') {        // sysDescr
@@ -239,36 +193,70 @@ function doGet(source, target, oid) {
     }
 
     let snmpValues = loadedValues.get(target);
-    if (!snmpValues) {
+    if (snmpValues != null) {
         return snmpValues['.' + oid];
     }
     else {
-        const file = new_file(target + ".snmp");
-        if (!file.isFile()) {
-            return null;
-        }
-
-        snmpValues = loadedValues.get(target);
-        if (!snmpValues) {
-            snmpValues = loadSnmpValues('default');
-        }
-
-        return snmpValues.get('.' + oid);
+        return null;
     }
 }
 
-function binding(oid, value) {
-    let variable;
-    if (!value) {
-        variable = org.snmp4j.smi.Null.endOfMibView;
-    } else if (value.match(/^\d+$/)) {
-        variable = new org.snmp4j.smi.Integer32(value);
-    } else if (value.match(/^(\.\d+)+$/)) {
-        variable = new org.snmp4j.smi.OID(value);
-    } else {
-        variable = new org.snmp4j.smi.OctetString(value);
+function loadSnmpValues(target) {
+    const filename = target + ".snmp";
+    if (!new_file(filename).isFile()) {
+        return null;
     }
 
+    let prevKey;
+    const result = new java.util.LinkedHashMap();
+    readFile(filename)
+        .forEach(function(line) {
+            const keyValue = line.split(' = ', 2);
+            let key = keyValue[0];
+            let value = keyValue.length > 1 ? keyValue[1] : null;
+
+            if (!value) {  // text line continuation
+                // key exists from previous loop iteration
+                const prevVariable = result.get(prevKey);
+                const octet = prevVariable.getVariable();
+                octet.append(org.snmp4j.smi.OctetString.fromString(key, ' ', 16));
+            } else {
+                if (OID_NAMES[key]) {
+                    key = OID_NAMES[key];
+                }
+
+                if (value.startsWith('INTEGER: ')) {
+                    value = getBinding(key, new org.snmp4j.smi.Integer32(value.substring(9)));
+                } else if (value.startsWith('Counter32: ')) {
+                    value = getBinding(key, new org.snmp4j.smi.Counter32(value.substring(11)));
+                } else if (value.startsWith('Counter64: ')) {
+                    value = getBinding(key, new org.snmp4j.smi.Counter64(value.substring(11)));
+                } else if (value.startsWith('Hex-STRING: ')) {
+                    value = getBinding(key, org.snmp4j.smi.OctetString.fromString(value.substring(12), ' ', 16));
+                } else if (value === "\"\"") {
+                    value = getBinding(key, new org.snmp4j.smi.OctetString(""));
+                } else if (value.startsWith('Timeticks: ')) {
+                    const regex = /\((\d+)\)/gm;
+                    const result = regex.exec(value);
+                    value = getBinding(key, new org.snmp4j.smi.TimeTicks(java.lang.Long.parseLong(result[1])));
+                } else if (value.startsWith('OID: ')) {
+                    value = value.substring(5);
+                    if (value.startsWith('SNMPv2-SMI::enterprises')) {
+                        value = '.1.3.6.1.4.1' + value.substring(23);
+                    }
+                    value = getBinding(key, new org.snmp4j.smi.OID(value));
+                }
+
+                result.put(key, value);
+                prevKey = key;
+            }
+        });
+
+    loadedValues.put(target, result);
+    return result;
+}
+
+function getBinding(oid, variable) {
     return new org.snmp4j.smi.VariableBinding(new org.snmp4j.smi.OID(oid), variable);
 }
 
@@ -286,10 +274,5 @@ function listSnmpFiles() {
         return name.match("\.snmp$");
     });
 
-    if (files) {
-        java.util.Arrays.sort(files, new com.lbayer.simsnmp.AlphanumComparator());
-        return Java.from(files);
-    }
-
-    return null;
+    return Java.from(files);
 }
