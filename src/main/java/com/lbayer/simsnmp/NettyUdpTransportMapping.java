@@ -6,18 +6,20 @@ import io.netty.channel.*;
 import io.netty.channel.epoll.EpollChannelOption;
 import io.netty.channel.epoll.EpollDatagramChannel;
 import io.netty.channel.epoll.EpollEventLoopGroup;
+import io.netty.channel.group.DefaultChannelGroup;
+import io.netty.channel.socket.DatagramChannel;
 import io.netty.channel.socket.DatagramPacket;
+import io.netty.channel.unix.UnixChannelOption;
 import io.netty.handler.codec.bytes.ByteArrayEncoder;
 import io.netty.util.concurrent.DefaultThreadFactory;
+import io.netty.util.concurrent.GlobalEventExecutor;
 import org.apache.log4j.Logger;
 import org.snmp4j.TransportStateReference;
 import org.snmp4j.security.SecurityLevel;
 import org.snmp4j.smi.UdpAddress;
 import org.snmp4j.transport.UdpTransportMapping;
 
-import java.net.InetAddress;
 import java.net.InetSocketAddress;
-import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.LinkedBlockingDeque;
 import java.util.concurrent.ThreadFactory;
@@ -31,12 +33,13 @@ import java.util.concurrent.atomic.AtomicInteger;
 public class NettyUdpTransportMapping extends UdpTransportMapping
 {
     private static final Logger LOGGER = Logger.getLogger(NettyUdpTransportMapping.class);
-
-    private List<Channel> channels;
+    private final List<String> addresses;
 
     private ThreadPoolExecutor executor;
 
+    private DefaultChannelGroup channelGroup;
     private EventLoopGroup eventLoop;
+
     private int port;
 
     private ThreadLocal<TransportStateReference> localTransport;
@@ -44,30 +47,30 @@ public class NettyUdpTransportMapping extends UdpTransportMapping
     /**
      * Create the mapping.
      */
-    NettyUdpTransportMapping(int port) {
+    NettyUdpTransportMapping(List<String> addresses, int port) {
         super(null);
-        localTransport = new ThreadLocal<>();
+        this.addresses = addresses;
+        this.localTransport = new ThreadLocal<>();
         this.port = port;
     }
 
     @Override
     public boolean isListening()
     {
-        return channels != null && !channels.isEmpty();
+        return channelGroup != null && !channelGroup.isEmpty();
     }
 
     @Override
-    public void listen() {
-        executor = new ThreadPoolExecutor(3, 3, 10, TimeUnit.SECONDS, new LinkedBlockingDeque<>());
+    public void listen()
+    {
+        executor = new ThreadPoolExecutor(1, 1, 10, TimeUnit.SECONDS, new LinkedBlockingDeque<>());
         executor.allowCoreThreadTimeOut(true);
-        executor.setThreadFactory(new ThreadFactory()
-        {
+        executor.setThreadFactory(new ThreadFactory() {
             private AtomicInteger count = new AtomicInteger();
 
             @Override
-            public Thread newThread(Runnable r)
-            {
-                Thread t = new Thread(r, "SNMP Worker " + count.getAndIncrement());
+            public Thread newThread(Runnable r) {
+                var t = new Thread(r, "SNMP Worker " + count.getAndIncrement());
                 t.setDaemon(true);
                 t.setUncaughtExceptionHandler((t1, e) -> {
                     LOGGER.error("Uncaught exception", e);
@@ -77,71 +80,72 @@ public class NettyUdpTransportMapping extends UdpTransportMapping
             }
         });
 
+        channelGroup = new DefaultChannelGroup(GlobalEventExecutor.INSTANCE);
+
         eventLoop = new EpollEventLoopGroup(1, new DefaultThreadFactory("SNMP Event Thread", true));
 
-        channels = new ArrayList<>();
-        var address = "0.0.0.0";
         int receiveBufferSize = (1 << 16) - 1;
-        channels.add(
-            new Bootstrap()
+        for (var address : addresses) {
+            var datagramChannel = new Bootstrap()
                 .group(eventLoop)
                 .channel(EpollDatagramChannel.class)
                 .option(EpollChannelOption.IP_RECVORIGDSTADDR, true)
                 .option(ChannelOption.SO_RCVBUF, receiveBufferSize)
+                .option(UnixChannelOption.SO_REUSEPORT, true)
                 .option(ChannelOption.MESSAGE_SIZE_ESTIMATOR, new DefaultMessageSizeEstimator(receiveBufferSize))
-                .handler(new ChannelInitializer<>()
-                {
+                .handler(new ChannelInitializer<DatagramChannel>() {
                     @Override
-                    protected void initChannel(Channel c) {
+                    protected void initChannel(DatagramChannel c) {
                         c.pipeline().addLast(new SnmpDecoder(), new ByteArrayEncoder());
                     }
 
                     @Override
-                    public void exceptionCaught(ChannelHandlerContext ctx, Throwable cause) throws Exception
-                    {
+                    public void exceptionCaught(ChannelHandlerContext ctx, Throwable cause) throws Exception {
                         super.exceptionCaught(ctx, cause);
                         LOGGER.error("Error in SNMP listener", cause);
                     }
                 })
                 .bind(new InetSocketAddress(address, port))
                 .syncUninterruptibly()
-                .channel()
-        );
+                .channel();
+
+            channelGroup.add(datagramChannel);
+        }
     }
 
     @Override
     public void close() {
-        if (channels != null)
+        if (channelGroup != null)
         {
-            for (Channel channel : channels)
-            {
-                channel.close().syncUninterruptibly();
+            try {
+                channelGroup.close().sync();
+                channelGroup = null;
+
+                eventLoop.shutdownGracefully();
+            } catch (InterruptedException e) {
+                e.printStackTrace();
             }
-
-            channels = null;
-
-            eventLoop.shutdownGracefully();
         }
     }
 
     @Override
     public void sendMessage(UdpAddress targetAddress, byte[] message, TransportStateReference transportStateReference) {
-        InetAddress inetAddress = targetAddress.getInetAddress();
-        InetSocketAddress socketAddress = new InetSocketAddress(inetAddress, targetAddress.getPort());
+        var inetAddress = targetAddress.getInetAddress();
+        var socketAddress = new InetSocketAddress(inetAddress, targetAddress.getPort());
 
-        TransportStateReference t = localTransport.get();
-        Channel channel = (Channel) t.getSessionID();
+        var tsr = localTransport.get();
+        var channel = (Channel) tsr.getSessionID();
         channel.writeAndFlush(new DatagramPacket(Unpooled.wrappedBuffer(message), socketAddress));
     }
 
     String getLocalIp() {
-        TransportStateReference t = localTransport.get();
-        if (t == null)
+        var tsr = localTransport.get();
+        if (tsr == null)
         {
             return null;
         }
 
-        return ((UdpAddress) t.getAddress()).getInetAddress().getHostAddress();
+        return ((UdpAddress) tsr.getAddress()).getInetAddress().getHostAddress();
     }
 
     /**
@@ -160,13 +164,14 @@ public class NettyUdpTransportMapping extends UdpTransportMapping
             executor.execute(() -> {
                 try
                 {
-                    Channel channel = ctx.channel();
-                    InetSocketAddress remoteAddress = packet.sender();
-                    InetSocketAddress localAddress = packet.recipient();
-                    UdpAddress localUdpAddress = new UdpAddress(localAddress.getAddress(), localAddress.getPort());
+                    var channel = ctx.channel();
+                    var remoteAddress = packet.sender();
+                    var localAddress = packet.recipient();
+                    var localUdpAddress = new UdpAddress(localAddress.getAddress(), localAddress.getPort());
 
-                    TransportStateReference tsr = new TransportStateReference(NettyUdpTransportMapping.this, localUdpAddress, null, SecurityLevel.undefined, SecurityLevel.undefined, false, channel);
+                    var tsr = new TransportStateReference(NettyUdpTransportMapping.this, localUdpAddress, null, SecurityLevel.undefined, SecurityLevel.undefined, false, channel);
                     localTransport.set(tsr);
+
                     fireProcessMessage(new UdpAddress(remoteAddress.getAddress(), remoteAddress.getPort()), packet.content().nioBuffer(), tsr);
                 }
                 finally

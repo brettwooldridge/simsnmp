@@ -15,11 +15,15 @@ import org.snmp4j.security.SecurityProtocols;
 import org.snmp4j.security.USM;
 import org.snmp4j.smi.*;
 
-import javax.script.*;
+import javax.script.Invocable;
+import javax.script.ScriptContext;
+import javax.script.ScriptException;
+import javax.script.SimpleScriptContext;
 import java.io.File;
 import java.io.FileReader;
 import java.io.IOException;
-import java.io.Reader;
+import java.net.NetworkInterface;
+import java.net.SocketException;
 import java.nio.file.*;
 import java.util.*;
 import java.util.concurrent.Semaphore;
@@ -43,7 +47,7 @@ public class Server implements CommandResponder
     public static void main(String[] args)
     {
         String config = "agent.conf";
-        ListIterator<String> listIterator = Arrays.asList(args).listIterator();
+        var listIterator = Arrays.asList(args).listIterator();
         while (listIterator.hasNext())
         {
             String next = listIterator.next();
@@ -66,12 +70,12 @@ public class Server implements CommandResponder
             }
         }
 
-        Properties props = new Properties();
+        var props = new Properties();
 
-        File file = new File(config);
+        var file = new File(config);
         if (file.isFile())
         {
-            try (FileReader reader = new FileReader(file))
+            try (var reader = new FileReader(file))
             {
                 props.load(reader);
             }
@@ -86,7 +90,7 @@ public class Server implements CommandResponder
 
         Logger rootLogger = Logger.getRootLogger();
 
-        ConsoleAppender consoleAppender = new ConsoleAppender(new PatternLayout("%d{HH:mm:ss,SSS} [%-25t] %-5p - %m%n"));
+        var consoleAppender = new ConsoleAppender(new PatternLayout("%d{HH:mm:ss,SSS} [%-25t] %-5p - %m%n"));
         rootLogger.addAppender(consoleAppender);
         consoleAppender.setTarget("System.err");
         consoleAppender.setThreshold(Level.INFO);
@@ -94,7 +98,7 @@ public class Server implements CommandResponder
 
         try
         {
-            Server server = new Server(props);
+            var server = new Server(props);
             server.startServer();
         }
         catch (Throwable e)
@@ -105,12 +109,12 @@ public class Server implements CommandResponder
 
     private synchronized Invocable getHandlerScript()
     {
-        try (Reader r = new FileReader(handlerScriptName)) {
-            ScriptContext ctx = new SimpleScriptContext();
-            Bindings bindings = ctx.getBindings(ScriptContext.ENGINE_SCOPE);
+        try (var r = new FileReader(handlerScriptName)) {
+            var ctx = new SimpleScriptContext();
+            var bindings = ctx.getBindings(ScriptContext.ENGINE_SCOPE);
             bindings.put("LOGGER", LOGGER);
 
-            ScriptEngine engine = new NashornScriptEngineFactory().getScriptEngine("--language=es6");
+            var engine = new NashornScriptEngineFactory().getScriptEngine("--language=es6");
 
             LOGGER.info("Loading handler script " + handlerScriptName);
 
@@ -125,14 +129,14 @@ public class Server implements CommandResponder
         }
     }
 
-    private VariableBinding getValue(String source, String target, int type, OID oid) {
+    private VariableBinding[] getValue(String source, String target, int type, OID oid, int repetitions) {
         if (LOGGER.isDebugEnabled()) LOGGER.debug("getValue(source=" + source + ", target=" + target + ", oid=" + oid + ")");
 
         try {
             // Check the watch service to see whether the script has changed (and reload)
             for (WatchKey key = watchService.poll(); key != null; key = watchService.poll()) {
                 for (WatchEvent<?> event : key.pollEvents()) {
-                    final Path path = (Path) event.context();
+                    final var path = (Path) event.context();
                     if (event.kind() != StandardWatchEventKinds.OVERFLOW && path.endsWith(handlerScriptName)) {
                         handlerImpl = getHandlerScript();
                         break;
@@ -144,21 +148,32 @@ public class Server implements CommandResponder
             String method;
             switch (type)
             {
-            case PDU.GET:
-                method = "get";
-                break;
+                case PDU.GET:
+                    method = "get";
+                    break;
 
-            case PDU.GETNEXT:
-                method = "getnext";
-                break;
+                case PDU.GETNEXT:
+                    method = "getnext";
+                    break;
 
-            default:
-                return null;
+                case PDU.GETBULK:
+                    method = "getbulk";
+                    break;
+                default:
+                    return null;
             }
 
-            var object = (VariableBinding) handlerImpl.invokeFunction(method, source, target, oid.toDottedString());
-            if (LOGGER.isDebugEnabled()) LOGGER.debug("Invoked " + method + " with result class " + object.getClass() + " and value: " + object);
-            return object;
+            var binding = handlerImpl.invokeFunction(method, source, target, oid.toDottedString(), repetitions);
+            if (binding != null && LOGGER.isDebugEnabled()) LOGGER.debug("Invoked " + method + " with result class " + binding.getClass() + " and value: " + binding);
+
+            if (binding instanceof VariableBinding) {
+                var array = new VariableBinding[1];
+                array[0] = (VariableBinding) binding;
+                return array;
+            }
+            else {
+                return (VariableBinding[]) binding;
+            }
         }
         catch (NoSuchMethodException | ScriptException  e) {
             LOGGER.error("Error executing handler script", e);
@@ -175,8 +190,9 @@ public class Server implements CommandResponder
                 LOGGER.debug("  Peer address: " + event.getPeerAddress() + ", target address: " + ((NettyUdpTransportMapping) event.getTransportMapping()).getLocalIp());
             }
 
-            PDU reqPdu = event.getPDU();
-            handleGet(event, reqPdu);
+            var reqPdu = event.getPDU();
+            var repetitions = (reqPdu instanceof PDUv1) ? 0 : reqPdu.getMaxRepetitions();
+            handleGet(event, reqPdu, repetitions);
         }
         catch (Throwable e)
         {
@@ -184,7 +200,7 @@ public class Server implements CommandResponder
         }
     }
 
-    private void handleGet(CommandResponderEvent event, PDU reqPdu)
+    private void handleGet(CommandResponderEvent event, PDU reqPdu, int repetitions)
     {
         PDU pdu = (PDU) event.getPDU().clone();
         pdu.setType(PDU.RESPONSE);
@@ -197,8 +213,8 @@ public class Server implements CommandResponder
         {
             OID oid = reqVar.getOid();
 
-            VariableBinding binding = getValue(source, target, reqPdu.getType(), oid);
-            if (binding == null)
+            VariableBinding[] bindings = getValue(source, target, reqPdu.getType(), oid, repetitions);
+            if (bindings == null)
             {
                 pdu.setErrorStatus(SnmpConstants.SNMP_ERROR_NO_SUCH_NAME);
                 if (event.getMessageProcessingModel() == MessageProcessingModel.MPv1)
@@ -210,13 +226,12 @@ public class Server implements CommandResponder
                     pdu.setErrorIndex(0);
                     reqVar.setVariable(Null.noSuchObject);
                 }
+                newVariables.add(reqVar);
             }
             else
             {
-                reqVar = binding;
+                Collections.addAll(newVariables, bindings);
             }
-
-            newVariables.add(reqVar);
         }
 
         pdu.setVariableBindings(newVariables);
@@ -239,9 +254,35 @@ public class Server implements CommandResponder
         }
     }
 
+    private List<String> getBindAddresses() throws SocketException
+    {
+        var addresses = new ArrayList<String>();
+
+        var ifaces = NetworkInterface.getNetworkInterfaces();
+        while (ifaces.hasMoreElements())
+        {
+            var inetAddresses = ifaces.nextElement().getInetAddresses();
+            while (inetAddresses.hasMoreElements())
+            {
+                String addr = inetAddresses.nextElement().getHostAddress();
+                addresses.add(addr);
+                LOGGER.debug("Added listen address: " + addr);
+            }
+        }
+
+        return addresses;
+    }
+
     private void startServer() throws IOException
     {
         LOGGER.info("Starting SNMP server");
+
+        var addresses = getBindAddresses();
+        if (addresses.isEmpty())
+        {
+            LOGGER.warn("No addresses to bind to");
+            return;
+        }
 
         handlerImpl = getHandlerScript();
 
@@ -249,7 +290,7 @@ public class Server implements CommandResponder
         final Path path = Paths.get(handlerScriptName).getParent();
         path.register(watchService, StandardWatchEventKinds.ENTRY_MODIFY);
 
-        NettyUdpTransportMapping transport = new NettyUdpTransportMapping(port);
+        NettyUdpTransportMapping transport = new NettyUdpTransportMapping(addresses, port);
 
         snmp = new Snmp(transport);
         snmp.addCommandResponder(this);
