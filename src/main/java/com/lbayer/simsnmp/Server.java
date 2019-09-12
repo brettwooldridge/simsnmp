@@ -24,9 +24,13 @@ import java.io.FileReader;
 import java.io.IOException;
 import java.net.NetworkInterface;
 import java.net.SocketException;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.*;
 import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Semaphore;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.regex.Pattern;
 
 public class Server implements CommandResponder
 {
@@ -37,11 +41,13 @@ public class Server implements CommandResponder
     private String handlerScriptName;
     private Invocable handlerImpl;
     private WatchService watchService;
+    private ConcurrentHashMap<String, LinkedHashMap<String, Object>> loadedMibs;
 
     private Server(Properties props)
     {
         this.port = Integer.parseInt(props.getProperty("port", "161"));
         this.handlerScriptName = props.getProperty("handler", System.getProperty("handler", "agent.js"));
+        this.loadedMibs = new ConcurrentHashMap<>();
     }
 
     public static void main(String[] args)
@@ -129,7 +135,7 @@ public class Server implements CommandResponder
         }
     }
 
-    private VariableBinding[] getValue(String source, String target, int type, OID oid, int repetitions) {
+    private VariableBinding[] getValue(String source, String target, int type, OID oid, Integer32 reqID, int repetitions) {
         if (LOGGER.isDebugEnabled()) LOGGER.debug("getValue(source=" + source + ", target=" + target + ", oid=" + oid + ")");
 
         try {
@@ -163,7 +169,7 @@ public class Server implements CommandResponder
                     return null;
             }
 
-            var binding = handlerImpl.invokeFunction(method, source, target, oid.toDottedString(), repetitions);
+            var binding = handlerImpl.invokeFunction(method, source, target, oid.toDottedString(), reqID, repetitions);
             if (binding != null && LOGGER.isDebugEnabled()) LOGGER.debug("Invoked " + method + " with result class " + binding.getClass() + " and value: " + binding);
 
             if (binding instanceof VariableBinding) {
@@ -191,8 +197,9 @@ public class Server implements CommandResponder
             }
 
             var reqPdu = event.getPDU();
+            var reqID = reqPdu.getRequestID();
             var repetitions = (reqPdu instanceof PDUv1) ? 0 : reqPdu.getMaxRepetitions();
-            handleGet(event, reqPdu, repetitions);
+            handleGet(event, reqPdu, reqID, repetitions);
         }
         catch (Throwable e)
         {
@@ -200,7 +207,7 @@ public class Server implements CommandResponder
         }
     }
 
-    private void handleGet(CommandResponderEvent event, PDU reqPdu, int repetitions)
+    private void handleGet(CommandResponderEvent event, PDU reqPdu, Integer32 reqID, int repetitions)
     {
         PDU pdu = (PDU) event.getPDU().clone();
         pdu.setType(PDU.RESPONSE);
@@ -211,9 +218,9 @@ public class Server implements CommandResponder
         String target = ((NettyUdpTransportMapping) event.getTransportMapping()).getLocalIp();
         for (VariableBinding reqVar : reqPdu.getVariableBindings())
         {
-            OID oid = reqVar.getOid();
+            var oid = reqVar.getOid();
 
-            VariableBinding[] bindings = getValue(source, target, reqPdu.getType(), oid, repetitions);
+            VariableBinding[] bindings = getValue(source, target, reqPdu.getType(), oid, reqID, repetitions);
             if (bindings == null)
             {
                 pdu.setErrorStatus(SnmpConstants.SNMP_ERROR_NO_SUCH_NAME);
@@ -273,9 +280,77 @@ public class Server implements CommandResponder
         return addresses;
     }
 
+    private static Pattern TABLE_REGEX = Pattern.compile("table ([.\\d]+)\\.([.c]+)\\.([.r]+)");
+
+    private class Table {
+        private class TableRow {
+            private ArrayList<VariableBinding> columns = new ArrayList<>();
+        }
+
+        private ArrayList<TableRow> tablesRows = new ArrayList<>();
+    }
+
+    private void loadMibs() throws IOException {
+        class TableInfo {
+            private String prefix;
+            private String column;
+            private String row;
+            private Pattern tableRegex;
+        }
+
+        final var tableInfo = new TableInfo();
+        final var tableRef = new AtomicReference<Table>();
+        Files.list(Paths.get("."))
+            .filter((path) -> path.endsWith(".snmp"))
+            .forEach((path) -> {
+                try {
+                    var ipAddress = path.toFile().getName();
+                    Files.lines(path, StandardCharsets.UTF_8)
+                        .filter((line) -> !line.startsWith("#"))
+                        .forEach((line) -> {
+                            if (line.startsWith("table ")) {
+                                var matchResult = TABLE_REGEX.matcher(line).toMatchResult();
+                                if (matchResult.groupCount() == 0) return;
+                                tableInfo.prefix = matchResult.group(1);
+                                var colCardinality = countChars(matchResult.group(2), 'c');
+                                var rowCardinality = countChars(matchResult.group(3), 'r');
+                                var pattern = String.format("((?:\\.[.\\d]){%d})((?:\\.[.\\d]){%d}) =", colCardinality, rowCardinality);
+                                tableInfo.tableRegex = Pattern.compile(pattern);
+                                tableRef.set(new Table());
+                                return;
+                            }
+
+                            if (tableInfo.tableRegex != null) {
+                                var matcher = tableInfo.tableRegex.matcher(line);
+                                if (matcher.find()) {
+                                    var colIndex = matcher.group(2);
+                                    var rowIndex = matcher.group(3);
+                                    return;
+                                }
+                                else {
+                                    tableInfo.tableRegex = null;
+                                }
+                            }
+
+                            // non-table OID
+                            tableInfo.prefix = null;
+                        });
+                    loadedMibs.put(ipAddress, null);
+                } catch (IOException e) {
+                    e.printStackTrace();
+                }
+            });
+    }
+
+    private int countChars(final String str, final char c) {
+        return (int) str.chars().filter(ch -> ch == c).count();
+    }
+
     private void startServer() throws IOException
     {
         LOGGER.info("Starting SNMP server");
+
+        loadMibs();
 
         var addresses = getBindAddresses();
         if (addresses.isEmpty())
