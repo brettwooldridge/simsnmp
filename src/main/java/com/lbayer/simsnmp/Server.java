@@ -280,66 +280,158 @@ public class Server implements CommandResponder
         return addresses;
     }
 
-    private static Pattern TABLE_REGEX = Pattern.compile("table ([.\\d]+)\\.([.c]+)\\.([.r]+)");
+    private static Pattern TABLE_REGEX = Pattern.compile("table ([.\\d]+)\\.([.c]+)\\.([.i]+)", Pattern.DOTALL);
 
-    private class Table {
-        private class TableRow {
-            private ArrayList<VariableBinding> columns = new ArrayList<>();
+    private static class Table {
+        private Pattern tableRegex;
+
+        private static class TableRow {
+            private Map<String, VariableBinding> columns = new HashMap<>();
         }
 
-        private ArrayList<TableRow> tablesRows = new ArrayList<>();
+        private Map<String, TableRow> tablesRows = new HashMap<>();
     }
 
     private void loadMibs() throws IOException {
-        class TableInfo {
-            private String prefix;
-            private String column;
-            private String row;
-            private Pattern tableRegex;
-        }
 
-        final var tableInfo = new TableInfo();
         final var tableRef = new AtomicReference<Table>();
         Files.list(Paths.get("."))
-            .filter((path) -> path.endsWith(".snmp"))
+            .filter((path) -> path.toString().endsWith(".snmp"))
             .forEach((path) -> {
                 try {
+                    tableRef.set(null);
                     var ipAddress = path.toFile().getName();
+                    var currBindingRef = new AtomicReference<VariableBinding>();
+
                     Files.lines(path, StandardCharsets.UTF_8)
                         .filter((line) -> !line.startsWith("#"))
                         .forEach((line) -> {
-                            if (line.startsWith("table ")) {
-                                var matchResult = TABLE_REGEX.matcher(line).toMatchResult();
-                                if (matchResult.groupCount() == 0) return;
-                                tableInfo.prefix = matchResult.group(1);
-                                var colCardinality = countChars(matchResult.group(2), 'c');
-                                var rowCardinality = countChars(matchResult.group(3), 'r');
-                                var pattern = String.format("((?:\\.[.\\d]){%d})((?:\\.[.\\d]){%d}) =", colCardinality, rowCardinality);
-                                tableInfo.tableRegex = Pattern.compile(pattern);
-                                tableRef.set(new Table());
+                            var map = loadedMibs.computeIfAbsent(ipAddress, s -> new LinkedHashMap<>());
+
+                            var matcher = TABLE_REGEX.matcher(line);
+                            if (line.startsWith("table ") && matcher.find()) {
+                                var prefix = matcher.group(1);
+                                var colCardinality = countChars(matcher.group(2), 'c');
+                                var rowCardinality = countChars(matcher.group(3), 'i');
+                                var table = new Table();
+                                table.tableRegex = Pattern.compile(String.format(prefix + "((?:\\.[.\\d]+){%d})((?:\\.[.\\d]+){%d}) =", colCardinality, rowCardinality));
+                                tableRef.set(table);
+
+                                map.put(prefix, table);
                                 return;
                             }
 
-                            if (tableInfo.tableRegex != null) {
-                                var matcher = tableInfo.tableRegex.matcher(line);
-                                if (matcher.find()) {
-                                    var colIndex = matcher.group(2);
-                                    var rowIndex = matcher.group(3);
+                            var keyValue = line.split(" = ", 2);
+
+                            final var table = tableRef.get();
+                            if (table != null && keyValue.length == 2) {
+                                var matcher2 = table.tableRegex.matcher(line);
+                                if (matcher2.find()) {
+                                    var colIndex = matcher2.group(1);
+                                    var rowIndex = matcher2.group(2);
+
+                                    var row = table.tablesRows.computeIfAbsent(rowIndex, s -> new Table.TableRow());
+                                    var column = row.columns.computeIfPresent(colIndex, (s, v) -> createBinding(line, v));
+                                    if (column == null) {
+                                        row.columns.put(colIndex, createBinding(line, null));
+                                    }
+
+                                    currBindingRef.set(row.columns.get(colIndex));
                                     return;
                                 }
                                 else {
-                                    tableInfo.tableRegex = null;
+                                    tableRef.set(null);
+                                    // fall thru
                                 }
                             }
 
-                            // non-table OID
-                            tableInfo.prefix = null;
+                            var key = keyValue[0];
+                            var value = keyValue.length > 1 ? keyValue[1] : null;
+
+                            if (value == null && currBindingRef.get() != null) {
+                                var binding = currBindingRef.get();
+                                createBinding(line, binding);
+                            }
+                            else {
+                                var binding = createBinding(line, null);
+                                map.put(key, binding);
+                                currBindingRef.set(binding);
+                            }
                         });
-                    loadedMibs.put(ipAddress, null);
                 } catch (IOException e) {
                     e.printStackTrace();
                 }
             });
+    }
+
+    private VariableBinding createBinding(final String line, final VariableBinding existing) {
+        var keyValue = line.split(" = ", 2);
+        var key = keyValue[0];
+        var value = keyValue.length > 1 ? keyValue[1] : null;
+
+        VariableBinding binding;
+        if (value == null && existing != null) {  // text line continuation
+            // key exists from previous loop iteration
+            var octet = (OctetString) existing.getVariable();
+            octet.append(org.snmp4j.smi.OctetString.fromString(key, ' ', 16));
+            return existing;
+        }
+        else if (value == null) {
+            throw new IllegalStateException("Invalid line: " + line);
+        }
+        else {
+            if (value.startsWith("INTEGER: ")) {
+                binding = new org.snmp4j.smi.VariableBinding(
+                    new org.snmp4j.smi.OID(key),
+                    new org.snmp4j.smi.Integer32(Integer.parseInt(value.substring(9)))
+                );
+            } else if (value.startsWith("Counter32: ")) {
+                binding = new org.snmp4j.smi.VariableBinding(
+                    new org.snmp4j.smi.OID(key),
+                    new org.snmp4j.smi.Counter32(Long.parseLong(value.substring(11)))
+                );
+            } else if (value.startsWith("Counter64: ")) {
+                binding = new org.snmp4j.smi.VariableBinding(
+                    new org.snmp4j.smi.OID(key),
+                    new org.snmp4j.smi.Counter64(Long.parseLong(value.substring(11)))
+                );
+            } else if (value.startsWith("Gauge32: ")) {
+                binding = new org.snmp4j.smi.VariableBinding(
+                    new org.snmp4j.smi.OID(key),
+                    new org.snmp4j.smi.Counter32(Long.parseLong(value.substring(11)))
+                );
+            } else if (value.startsWith("Hex-STRING: ")) {
+                binding = new org.snmp4j.smi.VariableBinding(
+                    new org.snmp4j.smi.OID(key),
+                    org.snmp4j.smi.OctetString.fromString(value.substring(12), ' ', 16)
+                );
+            } else if (value.equals("\"\"")) {
+                binding = new org.snmp4j.smi.VariableBinding(
+                    new org.snmp4j.smi.OID(key),
+                    new org.snmp4j.smi.OctetString("")
+                );
+            } else if (value.startsWith("Timeticks: ")) {
+                var regex = Pattern.compile("\\((\\d+)\\)").matcher(value);
+                if (!regex.find()) throw new IllegalStateException("No match for: " + value);
+                binding = new org.snmp4j.smi.VariableBinding(
+                    new org.snmp4j.smi.OID(key),
+                    new org.snmp4j.smi.TimeTicks(java.lang.Long.parseLong(regex.group(1)))
+                );
+            } else if (value.startsWith("OID: ")) {
+                value = value.substring(5);
+                if (value.startsWith("SNMPv2-SMI::enterprises")) {
+                    value = ".1.3.6.1.4.1" + value.substring(23);
+                }
+                binding = new org.snmp4j.smi.VariableBinding(
+                    new org.snmp4j.smi.OID(key),
+                    new org.snmp4j.smi.OID(value)
+                );
+            }
+            else {
+                throw new IllegalStateException("Invalid line: " + line);
+            }
+            return binding;
+        }
     }
 
     private int countChars(final String str, final char c) {
