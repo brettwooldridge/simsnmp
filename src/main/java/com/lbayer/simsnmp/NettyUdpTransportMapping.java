@@ -7,13 +7,17 @@ import io.netty.channel.epoll.EpollChannelOption;
 import io.netty.channel.epoll.EpollDatagramChannel;
 import io.netty.channel.epoll.EpollEventLoopGroup;
 import io.netty.channel.group.DefaultChannelGroup;
+import io.netty.channel.nio.NioEventLoopGroup;
 import io.netty.channel.socket.DatagramChannel;
 import io.netty.channel.socket.DatagramPacket;
+import io.netty.channel.socket.nio.NioDatagramChannel;
 import io.netty.channel.unix.UnixChannelOption;
 import io.netty.handler.codec.bytes.ByteArrayEncoder;
 import io.netty.util.concurrent.DefaultThreadFactory;
 import io.netty.util.concurrent.GlobalEventExecutor;
-import org.apache.log4j.Logger;
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
+import org.jetbrains.annotations.NotNull;
 import org.snmp4j.TransportStateReference;
 import org.snmp4j.security.SecurityLevel;
 import org.snmp4j.smi.UdpAddress;
@@ -32,7 +36,7 @@ import java.util.concurrent.atomic.AtomicInteger;
  */
 public class NettyUdpTransportMapping extends UdpTransportMapping
 {
-    private static final Logger LOGGER = Logger.getLogger(NettyUdpTransportMapping.class);
+    private static final Logger LOGGER = LogManager.getLogger(NettyUdpTransportMapping.class);
     private final List<String> addresses;
 
     private ThreadPoolExecutor executor;
@@ -69,7 +73,7 @@ public class NettyUdpTransportMapping extends UdpTransportMapping
             private AtomicInteger count = new AtomicInteger();
 
             @Override
-            public Thread newThread(Runnable r) {
+            public Thread newThread(@NotNull Runnable r) {
                 var t = new Thread(r, "SNMP Worker " + count.getAndIncrement());
                 t.setDaemon(true);
                 t.setUncaughtExceptionHandler((t1, e) -> {
@@ -82,13 +86,21 @@ public class NettyUdpTransportMapping extends UdpTransportMapping
 
         channelGroup = new DefaultChannelGroup(GlobalEventExecutor.INSTANCE);
 
-        eventLoop = new EpollEventLoopGroup(1, new DefaultThreadFactory("SNMP Event Thread", true));
+        Class<? extends Channel> channel;
+        if (System.getProperty("os.name").contains("inux")) {
+            channel = EpollDatagramChannel.class;
+            eventLoop = new EpollEventLoopGroup(1, new DefaultThreadFactory("SNMP Event Thread", true));
+        }
+        else {
+            channel = NioDatagramChannel.class;
+            eventLoop = new NioEventLoopGroup(1, new DefaultThreadFactory("SNMP Event Thread", true));
+        }
 
         int receiveBufferSize = (1 << 16) - 1;
         for (var address : addresses) {
             var datagramChannel = new Bootstrap()
                 .group(eventLoop)
-                .channel(EpollDatagramChannel.class)
+                .channel(channel)
                 .option(EpollChannelOption.IP_RECVORIGDSTADDR, true)
                 .option(ChannelOption.SO_RCVBUF, receiveBufferSize)
                 .option(UnixChannelOption.SO_REUSEPORT, true)
@@ -129,7 +141,7 @@ public class NettyUdpTransportMapping extends UdpTransportMapping
     }
 
     @Override
-    public void sendMessage(UdpAddress targetAddress, byte[] message, TransportStateReference transportStateReference) {
+    public void sendMessage(UdpAddress targetAddress, byte[] message, TransportStateReference transportStateReference, long timeoutMillis, int maxRetries) {
         var inetAddress = targetAddress.getInetAddress();
         var socketAddress = new InetSocketAddress(inetAddress, targetAddress.getPort());
 
