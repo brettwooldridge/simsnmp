@@ -1,0 +1,32 @@
+name: loadtest
+status: warn
+monitorInterval: 30
+shutdownHook: disable
+
+appenders:
+    Console:
+        name: Console
+        PatternLayout:
+            pattern: "%highlight{%d{HH:mm:ss,SSS} [%-25.25c{1}] [%-25.-25t] %-5p - %m%n}{INFO=white}"
+            charset: UTF-8
+            noConsoleNoAnsi: false
+
+    RollingFile:
+        - name: Main
+          fileName   : loadtest.log
+          filePattern: loadtest.%i.log
+          PatternLayout:
+              pattern: "%d{yy-MM-dd HH:mm:ss,SSS} [%-25.25c{1}] [%-28.-28t] %-5p - %m%n"
+              charset: UTF-8
+          Policies:
+              SizeBasedTriggeringPolicy:
+                  size: 2 MB
+          DefaultRolloverStrategy:
+              max: 5
+
+loggers:
+    Root:
+        level: ${sys:rootLogLevel:-info}
+        AppenderRef:
+            - ref: Console
+            - ref: Main
