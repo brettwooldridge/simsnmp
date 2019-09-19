@@ -108,12 +108,16 @@ private fun createBinding(line: String, existing: Variable?): Variable {
 
 private inline fun <reified T> createCounter(value: String): AbstractVariable {
     return if (value.startsWith("auto")) {
-        val (_, initial, increment) = autoRegex.find(value)!!.groupValues
-        VariantVariable(T::class.java.getDeclaredConstructor(java.lang.Long.TYPE).newInstance(initial.toLong()) as Variable, object: VariantVariableCallback {
+        val (_, initialStr, incrementStr) = autoRegex.find(value)!!.groupValues
+        val increment = incrementStr.toLong()
+        val twentyPct = (increment.toDouble() * 0.2).toLong()
+
+        val counter = T::class.java.getDeclaredConstructor(java.lang.Long.TYPE).newInstance(initialStr.toLong()) as Variable
+        VariantVariable(counter, object: VariantVariableCallback {
             override fun updateVariable(wrapper: VariantVariable) {
                 when (val variable = wrapper.variable) {
-                    is Counter32 -> variable.increment(increment.toLong())
-                    is Counter64 -> variable.increment(increment.toLong())
+                    is Counter32 -> variable.increment(increment - ThreadLocalRandom.current().nextLong(-twentyPct, twentyPct))
+                    is Counter64 -> variable.increment(increment - ThreadLocalRandom.current().nextLong(-twentyPct, twentyPct))
                 }
             }
 
