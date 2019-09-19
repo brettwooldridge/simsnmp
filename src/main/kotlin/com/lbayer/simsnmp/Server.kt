@@ -42,7 +42,7 @@ class Server private constructor(props: Properties) : CommandResponder {
     private val port = Integer.parseInt(props.getProperty("port", "161"))
     private val handlerScriptName = props.getProperty("handler", System.getProperty("handler", "agent.js"))
     private var handlerImpl: Invocable? = null
-    private val loadedMibs = loadMibs()
+    private lateinit var loadedMibs: LinkedHashMap<String, DeviceMib>
 
     override fun <A : Address?> processPdu(event: CommandResponderEvent<A>) {
         try {
@@ -113,7 +113,7 @@ class Server private constructor(props: Properties) : CommandResponder {
     private fun getValue(type: Any, target: String, oid: OID): VariableBinding? {
         return when (type) {
             PDU.GET -> {
-                val variable = loadedMibs[target]?.let { deviceMib-> deviceMib.oids[oid] }
+                val variable = loadedMibs[target]?.let { deviceMib-> deviceMib.oids[oid] } ?: return null
                 VariableBinding(oid, variable)
             }
             else    -> {
@@ -175,9 +175,11 @@ class Server private constructor(props: Properties) : CommandResponder {
 
     @Throws(IOException::class)
     private fun startServer() {
-        LOGGER.info("Starting SNMP server")
+        LOGGER.info("=========== SNMP Simulator ===========")
 
-        loadMibs()
+        LOGGER.info("Loading device MIB response files...")
+        loadedMibs = loadMibs()
+        LOGGER.info("Loaded ${loadedMibs.size} response files.")
 
         val addresses = bindAddresses
         if (addresses.isEmpty()) {
@@ -190,7 +192,9 @@ class Server private constructor(props: Properties) : CommandResponder {
         //        final Path path = Paths.get(handlerScriptName).getParent();
         //        path.register(watchService, StandardWatchEventKinds.ENTRY_MODIFY);
 
+        LOGGER.info("Binding to ${addresses.size} addresses...")
         val transport = NettyUdpTransportMapping(addresses, port)
+        LOGGER.info("Binding complete.")
 
         snmp = Snmp(transport)
         snmp!!.addCommandResponder(this)
@@ -198,7 +202,7 @@ class Server private constructor(props: Properties) : CommandResponder {
         SecurityModels.getInstance().addSecurityModel(usm)
         snmp!!.listen()
 
-        LOGGER.info("Listening for SNMP requests")
+        LOGGER.info("Listening for SNMP requests.")
 
         val semaphore = Semaphore(0)
         semaphore.acquireUninterruptibly()
