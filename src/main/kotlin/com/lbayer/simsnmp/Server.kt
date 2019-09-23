@@ -2,13 +2,8 @@
 
 package com.lbayer.simsnmp
 
-import jdk.nashorn.api.scripting.NashornScriptEngineFactory
 import org.apache.logging.log4j.LogManager
-import org.snmp4j.CommandResponder
-import org.snmp4j.CommandResponderEvent
-import org.snmp4j.MessageException
-import org.snmp4j.PDU
-import org.snmp4j.Snmp
+import org.snmp4j.*
 import org.snmp4j.mp.MPv3
 import org.snmp4j.mp.MessageProcessingModel
 import org.snmp4j.mp.SnmpConstants
@@ -16,11 +11,7 @@ import org.snmp4j.mp.StatusInformation
 import org.snmp4j.security.SecurityModels
 import org.snmp4j.security.SecurityProtocols
 import org.snmp4j.security.USM
-import org.snmp4j.smi.Address
-import org.snmp4j.smi.Null
-import org.snmp4j.smi.OID
-import org.snmp4j.smi.OctetString
-import org.snmp4j.smi.VariableBinding
+import org.snmp4j.smi.*
 import java.io.File
 import java.io.FileReader
 import java.io.IOException
@@ -28,10 +19,6 @@ import java.net.NetworkInterface
 import java.net.SocketException
 import java.util.*
 import java.util.concurrent.Semaphore
-import javax.script.Invocable
-import javax.script.ScriptContext
-import javax.script.ScriptException
-import javax.script.SimpleScriptContext
 import kotlin.collections.ArrayList
 import kotlin.math.abs
 import kotlin.system.exitProcess
@@ -40,8 +27,8 @@ class Server private constructor(props: Properties) : CommandResponder {
 
     private var snmp: Snmp? = null
     private val port = Integer.parseInt(props.getProperty("port", "161"))
-    private val handlerScriptName = props.getProperty("handler", System.getProperty("handler", "agent.js"))
-    private var handlerImpl: Invocable? = null
+    private val handlerScriptName =
+    // private var handlerImpl: Invocable? = null
     private lateinit var loadedMibs: LinkedHashMap<String, DeviceMib>
 
     override fun <A : Address?> processPdu(event: CommandResponderEvent<A>) {
@@ -60,11 +47,11 @@ class Server private constructor(props: Properties) : CommandResponder {
             val target = (event.transportMapping as NettyUdpTransportMapping).localIp
 
             val responseBindings = ArrayList<VariableBinding>()
-            var variableBindings = reqPdu.variableBindings
+            var nextBindings = reqPdu.variableBindings
             for (i in 0 until repetitions) {
                 val newBindings = ArrayList<VariableBinding>()
 
-                for (reqVar in variableBindings) {
+                for (reqVar in nextBindings) {
                     val oid = reqVar.oid
 
                     val binding = getValue(reqPdu.type, target, oid)
@@ -84,7 +71,7 @@ class Server private constructor(props: Properties) : CommandResponder {
                 }
 
                 if (reqPdu.type == PDU.GETBULK) {
-                    variableBindings = newBindings
+                    nextBindings = newBindings
                 }
 
                 responseBindings.addAll(newBindings)
@@ -131,30 +118,6 @@ class Server private constructor(props: Properties) : CommandResponder {
         }
     }
 
-    @Suppress("unused")
-    private val handlerScript: Invocable?
-        @Synchronized get() = try {
-            FileReader(handlerScriptName).use { r ->
-                val ctx = SimpleScriptContext()
-                val bindings = ctx.getBindings(ScriptContext.ENGINE_SCOPE)
-                bindings["LOGGER"] = LOGGER
-
-                val engine = NashornScriptEngineFactory().getScriptEngine("--language=es6")
-
-                LOGGER.info("Loading handler script $handlerScriptName")
-
-                engine.context = ctx
-                engine.eval(r)
-
-                handlerImpl = engine as Invocable
-                return handlerImpl
-            }
-        } catch (e: ScriptException) {
-            throw RuntimeException(e)
-        } catch (e: IOException) {
-            throw RuntimeException(e)
-        }
-
     private val bindAddresses: List<String>
         @Throws(SocketException::class)
         get() {
@@ -187,10 +150,8 @@ class Server private constructor(props: Properties) : CommandResponder {
             return
         }
 
-        // handlerImpl = getHandlerScript();
-
-        //        final Path path = Paths.get(handlerScriptName).getParent();
-        //        path.register(watchService, StandardWatchEventKinds.ENTRY_MODIFY);
+        // Incur Nashorn classloading cost at startup, rather than upon first request (throw away result)
+        getHandlerScript(handlerScriptName)
 
         LOGGER.info("Binding to ${addresses.size} addresses...")
         val transport = NettyUdpTransportMapping(addresses, port)
@@ -209,7 +170,7 @@ class Server private constructor(props: Properties) : CommandResponder {
     }
 
     companion object {
-        private val LOGGER = LogManager.getLogger(Server::class.java)
+        internal val LOGGER = LogManager.getLogger(Server::class.java)
 
         @JvmStatic
         fun main(args: Array<String>) {

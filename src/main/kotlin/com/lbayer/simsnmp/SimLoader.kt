@@ -1,17 +1,10 @@
+@file:Suppress("DEPRECATION")
+
 package com.lbayer.simsnmp
 
-import org.snmp4j.smi.AbstractVariable
-import org.snmp4j.smi.Counter32
-import org.snmp4j.smi.Counter64
-import org.snmp4j.smi.Gauge32
-import org.snmp4j.smi.Integer32
-import org.snmp4j.smi.OID
-import org.snmp4j.smi.OctetString
-import org.snmp4j.smi.TimeTicks
-import org.snmp4j.smi.UnsignedInteger32
-import org.snmp4j.smi.Variable
-import org.snmp4j.smi.VariantVariable
-import org.snmp4j.smi.VariantVariableCallback
+import jdk.nashorn.api.scripting.NashornScriptEngineFactory
+import org.snmp4j.smi.*
+import java.io.FileReader
 import java.io.IOException
 import java.nio.charset.StandardCharsets
 import java.nio.file.Files
@@ -19,11 +12,20 @@ import java.nio.file.Paths
 import java.util.*
 import java.util.concurrent.ThreadLocalRandom
 import java.util.concurrent.atomic.AtomicReference
+import javax.script.*
 import kotlin.collections.LinkedHashMap
 import kotlin.math.max
 import kotlin.math.min
 
 private val autoRegex = Regex("""auto\((\d+),\s*(\d+)\)""")
+private val jsFunc1Regex = Regex("""(\w+)\((([^,]+,?\s*)*)\)""")
+
+private val jsEngine = object : ThreadLocal<Invocable>() {
+    override fun initialValue(): Invocable {
+        val script = System.getProperty("handler", "agent.js")
+        return getHandlerScript(script)
+    }
+}
 
 internal class DeviceMib(val oids: SortedMap<OID, Variable>) {
     val keys = oids.keys.toList()
@@ -150,5 +152,45 @@ private fun createGauge(value: String): AbstractVariable {
     }
     else {
         Gauge32(value.toLong())
+    }
+}
+
+private fun createJavascript(value: String): AbstractVariable {
+    val (funcName, params) = jsFunc1Regex.find(value)!!.groupValues
+    val invokeFuncSig = """$funcName(variable${if (params.isBlank()) "" else ", " + params})"""
+    return VariantVariable(Gauge32(), object : VariantVariableCallback {
+        override fun updateVariable(wrapper: VariantVariable?) {
+            jsEngine.get().invokeMethod(null, invokeFuncSig, wrapper)
+        }
+
+        override fun variableUpdated(p0: VariantVariable?) {}
+    })
+}
+
+@Suppress("unused")
+internal fun getHandlerScript(handlerScriptName: String): Invocable {
+    try {
+        Server.LOGGER.info("Loading handler script $handlerScriptName")
+        FileReader(handlerScriptName).use { r ->
+            val ctx = SimpleScriptContext()
+            val bindings = ctx.getBindings(ScriptContext.ENGINE_SCOPE)
+            bindings["LOGGER"] = Server.LOGGER
+
+            val engine = NashornScriptEngineFactory().getScriptEngine("--language=es6") // "--global-per-engine"
+            engine.context = ctx
+
+            val compilable = engine as Compilable
+            val compiled = compilable.compile(r)
+            compiled.eval()
+
+
+            // engine.eval(r)
+
+            return engine as Invocable
+        }
+    } catch (e: ScriptException) {
+        throw RuntimeException(e)
+    } catch (e: IOException) {
+        throw RuntimeException(e)
     }
 }
